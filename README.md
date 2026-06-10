@@ -1,33 +1,73 @@
-The third-party evidence points to Claude Code being an agent harness that repeatedly forces the model through inspect → act → observe → update loops, not a normal chat model obeying a single “be careful” prompt.
+Yes. **Claude Code now supports per-subagent model selection.** You can have one model plan/scope, another implement, and another independently review.
 
-The best third-party breakdown I found is the 2026 arXiv paper “Dive into Claude Code”, which says it analyzed the publicly available TypeScript source and found that the core is a simple loop that calls the model, runs tools, and repeats, while most of the product is the operational system around that loop: permissions, compaction, skills/hooks, subagents, session storage, etc. It explicitly says Claude Code’s agent loop assembles context, calls the model, receives tool-use requests, gates them through permissions, dispatches tools, and feeds results back into the next model call.
+The native way is to create custom subagents under `.claude/agents/` or `~/.claude/agents/`. Anthropic’s docs say each subagent has its own context window, custom system prompt, tool access, permissions, and independent model setting. The `model` frontmatter can be `sonnet`, `opus`, `haiku`, `fable`, a full model ID such as `claude-opus-4-8`, or `inherit`. If omitted, it inherits the main conversation model. ([Claude Code][1]) ([Claude Code][1])
 
-The third-party paper’s most important line for your question is this: only about 1.6% is estimated to be AI decision logic, while the other 98.4% is operational infrastructure. That supports your instinct: this is not “one prompt line made it careful.” It is a large harness around the model.
+Example reviewer agent:
 
-A second third-party source, Varonis Threat Labs, says the leaked Claude Code CLI was about 1,900 files and 512,000+ lines, and describes it as “not just a chat interface with tool calling,” but a full agentic system with permission model, plugin architecture, multi-agent coordination, memory, and terminal UI. Varonis also identifies the QueryEngine as the heart of the product, handling streaming, tool-call loops, thinking mode, retries, token/context management, and permission wrapping.
+```md
+# .claude/agents/opus-reviewer.md
+---
+name: opus-reviewer
+description: Use after implementation to independently review code changes, find bugs, check architecture, inspect tests, and challenge assumptions.
+model: opus
+tools: Read, Grep, Glob, Bash
+permissionMode: plan
+---
 
-So the direct answer is:
+You are an independent senior code reviewer.
 
-Claude Code behaves as though it investigates first because its runtime keeps giving the model cheap, structured ways to investigate, then makes investigation results part of the next prompt. The model does not “know” the repo magically. It is repeatedly pushed into using tools: search files, read files, run commands, inspect git state, execute tests/builds, spawn subagents, update todos, and verify results. Tool output is serialized back into the conversation, so the next model call has evidence rather than just priors. Varonis describes this exact tool flow: input streams from the model, validation runs, permissions are checked, the tool executes, large results are persisted if needed, and output is serialized back into the conversation.
+Your job is not to rubber-stamp the main agent. Inspect the actual repository state and git diff before making claims.
 
-The prompt-extraction evidence is also much stronger than “marketing.” Piebald-AI’s repo says Claude Code does not have one system prompt; it has 110+ prompt strings, including tool descriptions, builtin agents like Explore/Plan, utility prompts, compaction prompts, and reminders. It says these strings are extracted from the compiled Claude Code source and updated per release.
+Review process:
+1. Run `git diff` and inspect the changed files.
+2. Identify correctness, security, maintainability, performance, and testing risks.
+3. Check whether tests exist for the changed behaviour.
+4. Run safe read-only verification commands where useful.
+5. Return findings ranked by severity.
+6. Clearly separate confirmed issues from suspicions.
+7. Do not modify files.
+```
 
-The extracted prompts show several concrete enforcement mechanisms:
+Then run your main session on a cheaper/faster model:
 
-Truthful reporting / no fake completion. One system prompt says to report outcomes faithfully: if tests fail, say so with output; if a step was skipped, say it; only state done when done and verified.
-Frontend verification requirement. Another extracted prompt says that for UI/frontend changes, Claude must start the dev server and use the feature in a browser before reporting completion; if it cannot test the UI, it must say that explicitly rather than claiming success.
-Plan mode before nontrivial implementation. The EnterPlanMode tool description says Claude should use plan mode for nontrivial implementation tasks, especially when requirements are unclear, multiple approaches exist, architecture is involved, or several files are affected.
-Todo/state tracking. The TodoWrite tool description tells Claude to create structured task lists for complex tasks, mark one task in progress, update status in real time, and not mark tasks complete when tests fail, implementation is partial, errors remain unresolved, or needed files/dependencies cannot be found.
-Search-first affordances. The extracted Grep tool description says Claude should always use the optimized search tool for search tasks and use task/subagent tooling for open-ended multi-round searches.
-Subagents for investigation without polluting context. The extracted subagent guidance says to use specialized agents for matching tasks, especially for parallel independent queries or to protect the main context window from excessive results. The third-party arXiv paper backs this up, describing built-in Explore, Plan, general-purpose, and Verification agents, with isolated contexts and tool restrictions.
-Verification as a separate skill. The extracted Verify skill is extremely explicit: “Verification is runtime observation,” and the agent should build/run the app, drive the changed surface, and capture evidence. It says the diff is ground truth and descriptions are claims. It also says PASS means the app was run and the change worked at its surface — not merely that tests pass, the build is clean, or the code looks right — and that ambiguous output should fail rather than be interpreted optimistically.
+```bash
+claude --model sonnet
+```
 
-That last Verify skill is probably the closest direct proof of the behavior you mean. It is not “be honest.” It is a whole verification protocol:
+And explicitly invoke the reviewer:
 
-Find the change → identify the runtime surface → run the real app/interface → probe adjacent cases → capture stdout/screenshots/responses → report PASS/FAIL/BLOCKED/SKIP with evidence.
+```text
+Use the opus-reviewer agent to review my recent changes before I commit.
+```
 
-My conclusion from the third-party evidence:
+Claude Code also supports explicit subagent invocation by name, and the docs say this bypasses automatic matching. ([Claude Code][1])
 
-Claude Code’s “investigate before asserting” behavior is caused primarily by the harness, not by a single prompt. The leaked/source-analyzed architecture shows a ReAct-style loop where the model proposes tool calls, the CLI validates and runs them, then returns real observations into the next model turn. Around that loop, Claude Code adds many prompt fragments, tool descriptions, todo tracking, plan mode, permissions, hooks, skills, subagents, context compaction, and verification protocols. The model is therefore repeatedly given both an instruction and an affordance to inspect reality before answering. The extracted Verify skill is the clearest proof: it defines verification as runtime observation with captured evidence, treats the diff as ground truth, rejects “tests passed” or “code looks right” as sufficient proof, and says ambiguous output should fail rather than be interpreted optimistically.
+Important gotcha: **do not set `CLAUDE_CODE_SUBAGENT_MODEL`** if you want different models per agent. The docs say subagent model resolution is: environment variable first, then per-invocation model, then the subagent’s frontmatter, then the main model. So that env var can override all your careful per-agent model choices. ([Claude Code][1])
 
-The part I cannot honestly prove from public sources is “Anthropic trained the base model itself to always investigate in general chat.” The leaked material and third-party analyses are about the Claude Code CLI/harness, not model weights or training data. The public proof supports: Claude Code sticks the model in line by wrapping it in a large operational harness plus many extracted prompt/tool protocols, not merely by telling the base model “don’t jump to answers.”
+A sensible setup would be:
+
+```text
+Main session:        sonnet
+Explore/search:     built-in Explore, already Haiku
+Planning/scoping:   opusplan or custom opus planner
+Implementation:     sonnet
+Final review:       opus or fable
+Test runner:        sonnet or haiku, Bash-enabled
+Security review:    opus/fable, read-only
+```
+
+There is also a built-in shortcut called `opusplan`: Claude Code uses Opus during plan mode and Sonnet during execution. That gives you “strong model for planning, cheaper model for coding” without custom agents. ([Claude Code][2])
+
+For SDK use, it is even more explicit: `AgentDefinition` has a `model` field, and the official SDK example shows a `code-reviewer` subagent with `model="sonnet"` while other agents use defaults. The docs also show dynamically choosing `opus` for stricter security reviews and `sonnet` for balanced ones. ([Claude Code][3]) ([Claude Code][3])
+
+For **non-Anthropic models** like Kimi, DeepSeek, GLM, GPT, or Gemini: not directly as first-class Claude Code models unless you route through an LLM gateway/proxy. Claude Code supports LLM gateways; Anthropic’s docs describe gateway model routing and model discovery, and LiteLLM documents using Claude Code with OpenAI, Gemini, Azure, Vertex, DeepSeek, and other providers by translating to the Anthropic Messages API. ([Claude Code][4]) ([LiteLLM][5])
+
+So the answer is:
+
+**Yes, natively for different Claude models per subagent. For genuinely different providers, yes in practice, but through a gateway like LiteLLM/OpenRouter/Bifrost/vLLM, and you need the non-Claude model to handle Claude Code’s tool-calling style well.**
+
+[1]: https://code.claude.com/docs/en/sub-agents "Create custom subagents - Claude Code Docs"
+[2]: https://code.claude.com/docs/en/model-config "Model configuration - Claude Code Docs"
+[3]: https://code.claude.com/docs/en/agent-sdk/subagents "Subagents in the SDK - Claude Code Docs"
+[4]: https://code.claude.com/docs/en/llm-gateway "LLM gateway configuration - Claude Code Docs"
+[5]: https://docs.litellm.ai/docs/tutorials/claude_non_anthropic_models "Use Claude Code with Non-Anthropic Models | liteLLM"
